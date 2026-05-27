@@ -9,48 +9,47 @@ CC   := gcc
 LD   := ld
 QEMU := qemu-system-x86_64
 
-CFLAGS := \
-    -ffreestanding \
-    -fno-stack-protector \
-    -fno-builtin \
-    -fno-pic \
-    -m64 \
-    -O2 \
-    -Wall \
-    -Wextra \
-    -I. \
-    -IbootABI
-
-LDFLAGS_BOOT1 := \
-    -T linker_boot1.ld \
-    --no-dynamic-linker \
-    -nostdlib
-
-IMAGE_SIZE_KB := 1440
-
-QEMUFLAGS := \
-    -drive format=raw,file=$(IMAGE),if=ide,index=0,media=disk \
-    -m 128M \
-    -cpu qemu64 \
-    -no-reboot \
-    -no-shutdown \
-    -vga std \
-    -display gtk
-
-QEMUFLAGS_DEBUG := $(QEMUFLAGS) -s -S -d int,cpu_reset -D $(BUILD)/qemu.log
-
 BUILD := build
 IMAGE := $(BUILD)/tootboot.img
 BOOT0 := $(BUILD)/boot0.bin
 BOOT1 := $(BUILD)/boot1.bin
 
-# All C objects that get linked into boot1 binary
+IMAGE_SIZE_KB := 1440
+
+CFLAGS := \
+	-ffreestanding \
+	-fno-stack-protector \
+	-fno-builtin \
+	-fno-pic \
+	-m64 \
+	-O2 \
+	-Wall \
+	-Wextra \
+	-I. \
+	-IbootABI
+
+LDFLAGS_BOOT1 := \
+	-T linker_boot1.ld \
+	--no-dynamic-linker \
+	-nostdlib
+
+QEMUFLAGS := \
+	-drive format=raw,file=$(IMAGE),if=ide,index=0,media=disk \
+	-m 128M \
+	-cpu qemu64 \
+	-no-reboot \
+	-no-shutdown \
+	-vga std \
+	-display gtk
+
+QEMUFLAGS_DEBUG := $(QEMUFLAGS) -s -S -d int,cpu_reset -D $(BUILD)/qemu.log
+
 OBJS_BOOT1 := \
-    $(BUILD)/boot1.o \
-    $(BUILD)/bootabi.o \
-    $(BUILD)/tan.o \
-    $(BUILD)/linux.o \
-    $(BUILD)/multiboot.o
+	$(BUILD)/boot1.o \
+	$(BUILD)/bootabi.o \
+	$(BUILD)/tan.o \
+	$(BUILD)/linux.o \
+	$(BUILD)/multiboot.o
 
 .PHONY: all run debug info clean
 
