@@ -18,14 +18,14 @@ CFLAGS := \
     -O2 \
     -Wall \
     -Wextra \
-    -I.
+    -I. \
+    -IbootABI
 
 LDFLAGS_BOOT1 := \
     -T linker_boot1.ld \
     --no-dynamic-linker \
     -nostdlib
 
-# 1.44MB floppy-sized image so SeaBIOS is happy with INT 13h
 IMAGE_SIZE_KB := 1440
 
 QEMUFLAGS := \
@@ -44,14 +44,20 @@ IMAGE := $(BUILD)/tootboot.img
 BOOT0 := $(BUILD)/boot0.bin
 BOOT1 := $(BUILD)/boot1.bin
 
+# All C objects that get linked into boot1 binary
+OBJS_BOOT1 := \
+    $(BUILD)/boot1.o \
+    $(BUILD)/bootabi.o \
+    $(BUILD)/tan.o \
+    $(BUILD)/linux.o \
+    $(BUILD)/multiboot.o
+
 .PHONY: all run debug info clean
 
 all: $(IMAGE)
 
-# Pad image to IMAGE_SIZE_KB so BIOS geometry works
 $(IMAGE): $(BOOT0) $(BOOT1)
-	cat $(BOOT0) $(BOOT1) > $(BUILD)/tootboot_raw.img
-	cp $(BUILD)/tootboot_raw.img $@
+	cat $(BOOT0) $(BOOT1) > $@
 	truncate -s $(IMAGE_SIZE_KB)K $@
 	@echo "[IMG] $@ — $$(wc -c < $@) bytes"
 
@@ -59,11 +65,27 @@ $(BOOT0): boot0.asm | $(BUILD)
 	$(NASM) -f bin -o $@ $<
 	@echo "[AS]  $< — $$(wc -c < $@) bytes"
 
-$(BOOT1): $(BUILD)/boot1.o linker_boot1.ld | $(BUILD)
-	$(LD) $(LDFLAGS_BOOT1) -o $@ $<
+$(BOOT1): $(OBJS_BOOT1) linker_boot1.ld | $(BUILD)
+	$(LD) $(LDFLAGS_BOOT1) -o $@ $(OBJS_BOOT1)
 	@echo "[LD]  $@ — $$(wc -c < $@) bytes"
 
 $(BUILD)/boot1.o: boot1.c | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "[CC]  $<"
+
+$(BUILD)/bootabi.o: bootABI/bootabi.c | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "[CC]  $<"
+
+$(BUILD)/tan.o: bootABI/tan.c | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "[CC]  $<"
+
+$(BUILD)/linux.o: bootABI/linux.c | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "[CC]  $<"
+
+$(BUILD)/multiboot.o: bootABI/multiboot.c | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 	@echo "[CC]  $<"
 
@@ -76,9 +98,9 @@ run: $(IMAGE)
 debug: $(IMAGE)
 	$(QEMU) $(QEMUFLAGS_DEBUG)
 
-info: $(BUILD)/boot1.o
-	@echo "=== boot1 sections ==="
-	@objdump -h $(BUILD)/boot1.o
+info: $(OBJS_BOOT1)
+	@echo "=== boot1 + bootABI section sizes ==="
+	@size $(OBJS_BOOT1)
 
 clean:
 	rm -rf $(BUILD)
