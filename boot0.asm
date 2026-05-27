@@ -1,71 +1,60 @@
 ; boot0.asm — TootBoot stage 0
-; x86_64 | NASM | Real Mode -> Long Mode
-; Multiboot2 compatible + TootBoot ABI
+; x86_64 | NASM flat binary | Real Mode -> Long Mode
+; Multiboot2 + TootBoot ABI
 
-; ---------------------------------------------------------------------------
-; Constants
-; ---------------------------------------------------------------------------
+[BITS 16]
+[ORG 0x7C00]
+
+CR0_PE          equ (1 << 0)
+CR0_PG          equ (1 << 31)
+CR4_PAE         equ (1 << 5)
+EFER_MSR        equ 0xC0000080
+EFER_LME        equ (1 << 8)
+EFER_NXE        equ (1 << 11)
+GDT_CODE64_SEL  equ 0x18
+GDT_DATA64_SEL  equ 0x20
+PML4_ADDRESS    equ 0x1000
+PDPT_ADDRESS    equ 0x2000
+PD_ADDRESS      equ 0x3000
+BOOT1_ADDRESS   equ 0x7E00
+BOOT1_SECTORS   equ 16
+
 MULTIBOOT2_MAGIC equ 0xE85250D6
 MULTIBOOT2_ARCH  equ 0
 TOOTBOOT_MAGIC   equ 0x544F4F54
 
-CR0_PE   equ (1 << 0)
-CR0_PG   equ (1 << 31)
-CR4_PAE  equ (1 << 5)
-
-EFER_MSR equ 0xC0000080
-EFER_LME equ (1 << 8)
-EFER_NXE equ (1 << 11)
-
-GDT_CODE64_SEL equ 0x18
-GDT_DATA64_SEL equ 0x20
-
-PML4_ADDRESS equ 0x1000
-PDPT_ADDRESS equ 0x2000
-PD_ADDRESS   equ 0x3000
-
 ; ---------------------------------------------------------------------------
 ; Multiboot2 header
 ; ---------------------------------------------------------------------------
-section .multiboot2 progbits alloc noexec nowrite align=8
-
-multiboot2_header_start:
+mb2_start:
     dd MULTIBOOT2_MAGIC
     dd MULTIBOOT2_ARCH
-    dd (multiboot2_header_end - multiboot2_header_start)
-    dd -(MULTIBOOT2_MAGIC + MULTIBOOT2_ARCH + \
-         (multiboot2_header_end - multiboot2_header_start))
+    dd (mb2_end - mb2_start)
+    dd -(MULTIBOOT2_MAGIC + MULTIBOOT2_ARCH + (mb2_end - mb2_start))
     align 8
-    .tag_entry:
-        dw 3, 1
-        dd 12
-        dd _start
+    dw 3, 1
+    dd 12
+    dd _start
     align 8
-    .tag_end:
-        dw 0, 0
-        dd 8
-multiboot2_header_end:
+    dw 0, 0
+    dd 8
+mb2_end:
 
 ; ---------------------------------------------------------------------------
 ; TootBoot ABI header
 ; ---------------------------------------------------------------------------
-section .tootabi progbits alloc noexec nowrite align=8
-
-tootboot_abi_header:
+align 8
+tootabi:
     dd TOOTBOOT_MAGIC
-    dd 0x00010000       ; version 1.0.0
+    dd 0x00010000
     dd _start
-    dd boot1_entry_point
-    dd 0                ; reserved
-    dq 0                ; signature (future use)
+    dd BOOT1_ADDRESS
+    dd 0
+    dq 0
 
 ; ---------------------------------------------------------------------------
-; Boot sequence
+; Entry point
 ; ---------------------------------------------------------------------------
-section .text
-bits 16
-
-global _start
 _start:
     cli
     cld
@@ -77,13 +66,50 @@ _start:
     mov ss, ax
     mov sp, 0x7C00
 
+    mov [boot_drive], dl
+
+    ; -------------------------------------------------------------------------
+    ; Try INT 13h extended read (LBA) first
+    ; -------------------------------------------------------------------------
+    mov ah, 0x41             ; check extensions present
+    mov bx, 0x55AA
+    int 0x13
+    jc  .use_chs             ; no extensions -> fall back to CHS
+    cmp bx, 0xAA55
+    jne .use_chs
+
+    ; LBA read
+    mov si, dap
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    int 0x13
+    jnc .load_ok
+    jmp disk_error
+
+    ; -------------------------------------------------------------------------
+    ; CHS fallback (sector 2, head 0, cylinder 0)
+    ; -------------------------------------------------------------------------
+.use_chs:
+    mov ah, 0x02             ; read sectors
+    mov al, BOOT1_SECTORS    ; count
+    mov ch, 0                ; cylinder 0
+    mov cl, 2                ; sector 2 (1-based)
+    mov dh, 0                ; head 0
+    mov dl, [boot_drive]
+    mov bx, BOOT1_ADDRESS    ; ES:BX destination (ES=0)
+    int 0x13
+    jc  disk_error
+
+.load_ok:
+    ; -------------------------------------------------------------------------
+    ; Enable PAE + build page tables (2MB identity map)
+    ; -------------------------------------------------------------------------
     lgdt [gdt_ptr]
 
     mov eax, cr4
     or  eax, CR4_PAE
     mov cr4, eax
 
-    ; Identity map first 2MB via PML4 -> PDPT -> PD
     mov edi, PML4_ADDRESS
     xor eax, eax
     mov ecx, 3 * 4096 / 4
@@ -99,6 +125,9 @@ _start:
     mov eax, PML4_ADDRESS
     mov cr3, eax
 
+    ; -------------------------------------------------------------------------
+    ; Activate Long Mode
+    ; -------------------------------------------------------------------------
     mov ecx, EFER_MSR
     rdmsr
     or  eax, (EFER_LME | EFER_NXE)
@@ -110,7 +139,34 @@ _start:
 
     jmp GDT_CODE64_SEL:long_mode_entry
 
-bits 64
+; ---------------------------------------------------------------------------
+; Disk error: red 'E' on screen then halt
+; ---------------------------------------------------------------------------
+disk_error:
+    mov ax, 0xB800
+    mov es, ax
+    mov word [es:0], 0x4F45
+    cli
+    hlt
+
+; ---------------------------------------------------------------------------
+; DAP for INT 13h LBA read
+; ---------------------------------------------------------------------------
+align 4
+dap:
+    db  0x10
+    db  0x00
+    dw  BOOT1_SECTORS
+    dw  BOOT1_ADDRESS
+    dw  0x0000
+    dq  1
+
+boot_drive: db 0x80
+
+; ---------------------------------------------------------------------------
+; Long Mode
+; ---------------------------------------------------------------------------
+[BITS 64]
 long_mode_entry:
     mov ax, GDT_DATA64_SEL
     mov ds, ax
@@ -120,12 +176,11 @@ long_mode_entry:
     mov ss, ax
     mov rsp, 0x90000
 
-    ; rdi = ABI header, rsi = magic, rdx = PML4
-    mov rdi, tootboot_abi_header
+    mov rdi, tootabi
     mov rsi, TOOTBOOT_MAGIC
     mov rdx, PML4_ADDRESS
 
-    call boot1_entry_point
+    call BOOT1_ADDRESS
 
 .halt:
     cli
@@ -135,11 +190,9 @@ long_mode_entry:
 ; ---------------------------------------------------------------------------
 ; GDT
 ; ---------------------------------------------------------------------------
-section .data
 align 8
-
 gdt_start:
-    dq 0x0000000000000000   ; null
+    dq 0x0000000000000000
     dq 0x00CF9A000000FFFF   ; code32
     dq 0x00CF92000000FFFF   ; data32
     dq 0x00AF9A000000FFFF   ; code64
@@ -150,8 +203,5 @@ gdt_ptr:
     dw (gdt_end - gdt_start - 1)
     dq gdt_start
 
-extern boot1_entry_point
-
-section .mbr_signature
-    times (510 - ($ - $$)) db 0
-    dw 0xAA55
+times (510 - ($ - $$)) db 0
+dw 0xAA55
