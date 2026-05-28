@@ -385,11 +385,58 @@ static uint8_t kb_poll(void) {
     return 0;
 }
 
-/* Busy-wait ~1 second using PIT channel 2 */
-static void wait_one_second(void) {
-    /* Quick approximation: spin ~50M iterations at ~1GHz */
-    volatile uint32_t i = 50000000;
-    while (i--) __asm__ volatile ("pause");
+/* ---------------------------------------------------------------------------
+ * PIT (8253) based timing
+ * Channel 0 runs at 18.2 Hz by default (IRQ0, not connected to us).
+ * We reprogram channel 2 to count down from a known value and poll it.
+ * 1193182 Hz / 1193 ≈ 1000 ticks/sec (1ms per tick)
+ * ---------------------------------------------------------------------------*/
+#define PIT_CH2_DATA  0x42
+#define PIT_CMD       0x43
+#define PIT_KBD_CTRL  0x61
+
+static void pit_init_1ms(void) {
+    /* Channel 2, mode 0 (one-shot), binary, reload = 1193 (~1ms) */
+    outb(PIT_CMD, 0xB0);            /* channel 2, lobyte/hibyte, mode 0 */
+    outb(PIT_CH2_DATA, 0xA9);       /* reload low:  1193 & 0xFF = 0xA9 */
+    outb(PIT_CH2_DATA, 0x04);       /* reload high: 1193 >> 8   = 0x04 */
+}
+
+/* Wait approximately ms milliseconds using PIT channel 2 polling */
+static void pit_wait_ms(uint32_t ms) {
+    for (uint32_t i = 0; i < ms; i++) {
+        /* Enable gate for channel 2 */
+        uint8_t ctrl = inb(PIT_KBD_CTRL);
+        outb(PIT_KBD_CTRL, (ctrl & 0xFC) | 0x01);
+
+        /* Reload counter */
+        outb(PIT_CMD, 0xB0);
+        outb(PIT_CH2_DATA, 0xA9);
+        outb(PIT_CH2_DATA, 0x04);
+
+        /* Poll OUT pin (bit 5 of port 0x61) until it goes high */
+        while (!(inb(PIT_KBD_CTRL) & 0x20))
+            __asm__ volatile ("pause");
+    }
+}
+
+/* PIC: remap IRQs so spurious IRQ0 doesn't cause exceptions in 64-bit */
+static void pic_remap(void) {
+    /* ICW1 */
+    outb(0x20, 0x11);
+    outb(0xA0, 0x11);
+    /* ICW2: remap IRQ0-7 to 0x20, IRQ8-15 to 0x28 */
+    outb(0x21, 0x20);
+    outb(0xA1, 0x28);
+    /* ICW3 */
+    outb(0x21, 0x04);
+    outb(0xA1, 0x02);
+    /* ICW4 */
+    outb(0x21, 0x01);
+    outb(0xA1, 0x01);
+    /* Mask all interrupts */
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
 }
 
 /* ---------------------------------------------------------------------------
@@ -427,19 +474,26 @@ void __attribute__((section(".boot1_entry"))) boot1_entry_point(void) {
 
     redraw();
 
-    /* Main loop */
+    pic_remap();
+    pit_init_1ms();
+
+    /* Main loop — 1ms ticks, count to 1000 for 1 second */
+    uint32_t tick = 0;
+
     while (1) {
+        /* Poll keyboard */
         uint8_t key = kb_poll();
+        if (key & 0x80) goto next_tick;  /* ignore key-release scancodes */
 
         if (key) {
-            timeout = -1;   /* cancel auto-boot on any key */
+            timeout = -1;
 
             switch (key) {
                 case KEY_UP:
-                    if (selected > 0) selected--;
+                    if (selected > 0) { selected--; redraw(); }
                     break;
                 case KEY_DOWN:
-                    if (selected < entry_count - 1) selected++;
+                    if (selected < entry_count - 1) { selected++; redraw(); }
                     break;
                 case KEY_ENTER:
                     boot_entry(&entries[selected]);
@@ -447,16 +501,26 @@ void __attribute__((section(".boot1_entry"))) boot1_entry_point(void) {
                 default:
                     break;
             }
-            redraw();
         }
 
-        /* Timeout countdown */
-        if (timeout > 0) {
-            wait_one_second();
-            timeout--;
-            draw_timeout();
-        } else if (timeout == 0) {
-            boot_entry(&entries[0]);
+next_tick:
+        if (timeout < 0) {
+            pit_wait_ms(1);
+            continue;
+        }
+
+        /* 1ms tick — count to 1000 for 1 second */
+        pit_wait_ms(1);
+        tick++;
+
+        if (tick >= 1000) {
+            tick = 0;
+            if (timeout > 0) {
+                timeout--;
+                draw_timeout();
+            } else {
+                boot_entry(&entries[0]);
+            }
         }
     }
 }
