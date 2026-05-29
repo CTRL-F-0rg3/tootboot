@@ -174,13 +174,14 @@ static void draw_hints(void) {
 }
 
 static void draw_timeout(void) {
-    /* clear line */
     vga_hline(BORDER_X1 + 1, 22, BORDER_X2 - BORDER_X1 - 1, ' ', COLOR_DIM);
 
     if (timeout > 0) {
         vga_puts(ENTRY_X, 22, "Auto-boot in ", COLOR_DIM);
         vga_putint(ENTRY_X + 13, 22, timeout, COLOR_SELECTED);
         vga_puts(ENTRY_X + 14, 22, "s  (any key to cancel)", COLOR_DIM);
+    } else if (timeout == 0) {
+        vga_puts(ENTRY_X, 22, "Booting...", COLOR_SELECTED);
     } else {
         vga_puts(ENTRY_X, 22, "Timeout cancelled.", COLOR_DIM);
     }
@@ -378,6 +379,94 @@ static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" :: "a"(val), "Nd"(port));
 }
 
+/* ---------------------------------------------------------------------------
+ * ATA PIO disk read — works natively in 64-bit, no mode switching needed
+ * Reads 'sectors' sectors from LBA into buf using primary ATA channel
+ * ---------------------------------------------------------------------------*/
+#define ATA_DATA        0x1F0
+#define ATA_ERROR       0x1F1
+#define ATA_SECTOR_CNT  0x1F2
+#define ATA_LBA_LO      0x1F3
+#define ATA_LBA_MID     0x1F4
+#define ATA_LBA_HI      0x1F5
+#define ATA_DRIVE_HEAD  0x1F6
+#define ATA_CMD         0x1F7
+#define ATA_STATUS      0x1F7
+#define ATA_ALT_STATUS  0x3F6   /* alternate status — reading doesn't clear IRQ */
+#define ATA_CMD_READ    0x20
+#define ATA_CMD_RESET   0x04    /* device control reset */
+
+#define ATA_SR_BSY  0x80
+#define ATA_SR_DRQ  0x08
+#define ATA_SR_ERR  0x01
+
+static inline uint16_t inw(uint16_t port) {
+    uint16_t val;
+    __asm__ volatile ("inw %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+/* 400ns delay — read alt status 4 times */
+static void ata_delay400(void) {
+    inb(ATA_ALT_STATUS);
+    inb(ATA_ALT_STATUS);
+    inb(ATA_ALT_STATUS);
+    inb(ATA_ALT_STATUS);
+}
+
+static int ata_wait_bsy(void) {
+    for (uint32_t i = 0; i < 0x100000; i++) {
+        if (!(inb(ATA_ALT_STATUS) & ATA_SR_BSY)) return 0;
+    }
+    return -1;  /* timeout */
+}
+
+static int ata_wait_drq(void) {
+    for (uint32_t i = 0; i < 0x100000; i++) {
+        uint8_t s = inb(ATA_ALT_STATUS);
+        if (s & ATA_SR_ERR) return -1;
+        if (s & ATA_SR_DRQ) return 0;
+    }
+    return -1;  /* timeout */
+}
+
+static void ata_soft_reset(void) {
+    outb(ATA_ALT_STATUS, ATA_CMD_RESET);  /* assert SRST */
+    ata_delay400();
+    outb(ATA_ALT_STATUS, 0);              /* clear SRST */
+    ata_delay400();
+    ata_wait_bsy();
+}
+
+int disk_read(uint8_t drive, uint64_t lba, uint16_t sectors, void *buf) {
+    (void)drive;
+
+    ata_soft_reset();
+
+    /* Select master drive, LBA mode */
+    outb(ATA_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F));
+    ata_delay400();
+
+    if (ata_wait_bsy() != 0) return -1;
+
+    outb(ATA_SECTOR_CNT, (uint8_t)sectors);
+    outb(ATA_LBA_LO,     (uint8_t)(lba));
+    outb(ATA_LBA_MID,    (uint8_t)(lba >> 8));
+    outb(ATA_LBA_HI,     (uint8_t)(lba >> 16));
+    outb(ATA_CMD,        ATA_CMD_READ);
+    ata_delay400();
+
+    uint16_t *ptr = (uint16_t *)buf;
+    for (uint16_t s = 0; s < sectors; s++) {
+        if (ata_wait_drq() != 0) return -1;
+        for (int i = 0; i < 256; i++)
+            ptr[i] = inw(ATA_DATA);
+        ptr += 256;
+        ata_delay400();
+    }
+    return 0;
+}
+
 /* Returns scancode or 0 if no key ready */
 static uint8_t kb_poll(void) {
     if (inb(0x64) & 0x01)
@@ -386,38 +475,28 @@ static uint8_t kb_poll(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * PIT (8253) based timing
- * Channel 0 runs at 18.2 Hz by default (IRQ0, not connected to us).
- * We reprogram channel 2 to count down from a known value and poll it.
- * 1193182 Hz / 1193 ≈ 1000 ticks/sec (1ms per tick)
+ * CMOS RTC timing — reads seconds register, works in any emulator
  * ---------------------------------------------------------------------------*/
-#define PIT_CH2_DATA  0x42
-#define PIT_CMD       0x43
-#define PIT_KBD_CTRL  0x61
+#define CMOS_ADDR  0x70
+#define CMOS_DATA  0x71
+#define RTC_STATUS_A  0x0A
+#define RTC_SECONDS   0x00
 
-static void pit_init_1ms(void) {
-    /* Channel 2, mode 0 (one-shot), binary, reload = 1193 (~1ms) */
-    outb(PIT_CMD, 0xB0);            /* channel 2, lobyte/hibyte, mode 0 */
-    outb(PIT_CH2_DATA, 0xA9);       /* reload low:  1193 & 0xFF = 0xA9 */
-    outb(PIT_CH2_DATA, 0x04);       /* reload high: 1193 >> 8   = 0x04 */
+static uint8_t cmos_read(uint8_t reg) {
+    outb(CMOS_ADDR, reg);
+    return inb(CMOS_DATA);
 }
 
-/* Wait approximately ms milliseconds using PIT channel 2 polling */
-static void pit_wait_ms(uint32_t ms) {
-    for (uint32_t i = 0; i < ms; i++) {
-        /* Enable gate for channel 2 */
-        uint8_t ctrl = inb(PIT_KBD_CTRL);
-        outb(PIT_KBD_CTRL, (ctrl & 0xFC) | 0x01);
+static void rtc_wait_update(void) {
+    /* Wait for RTC update-in-progress flag to clear */
+    while (cmos_read(RTC_STATUS_A) & 0x80);
+}
 
-        /* Reload counter */
-        outb(PIT_CMD, 0xB0);
-        outb(PIT_CH2_DATA, 0xA9);
-        outb(PIT_CH2_DATA, 0x04);
-
-        /* Poll OUT pin (bit 5 of port 0x61) until it goes high */
-        while (!(inb(PIT_KBD_CTRL) & 0x20))
-            __asm__ volatile ("pause");
-    }
+static uint8_t rtc_seconds(void) {
+    rtc_wait_update();
+    uint8_t s = cmos_read(RTC_SECONDS);
+    /* Convert BCD to binary */
+    return (s & 0x0F) + ((s >> 4) * 10);
 }
 
 /* PIC: remap IRQs so spurious IRQ0 doesn't cause exceptions in 64-bit */
@@ -442,14 +521,54 @@ static void pic_remap(void) {
 /* ---------------------------------------------------------------------------
  * Boot dispatch
  * ---------------------------------------------------------------------------*/
+/* Kernel load address — TanOS loads at 2MB */
+#define TANOS_LOAD_ADDR   0x200000
+/* Sector on disk where TanOS kernel lives (written by disk/justfile) */
+#define TANOS_DISK_SECTOR 34
+#define TANOS_DISK_SECTS  128   /* 64KB — enough for stub kernel */
+
+static uint8_t boot_drive_num = 0x80;
+
 static void __attribute__((noreturn)) boot_entry(BootEntry *e) {
-    /* TODO: load kernel from disk to e->load_addr, pass multiboot2 info */
+    volatile uint16_t *vga_dbg = (volatile uint16_t *)0xB8000;
 
-    /* For now: jump to load address directly */
-    void (*kernel)(void) = (void (*)(void))(uint64_t)e->load_addr;
-    kernel();
+    switch (e->type) {
 
-    /* Should never reach here */
+        case OS_TANOS: {
+            /* Step 1: show 'L' — loading */
+            vga_dbg[0] = 0x5F4C;
+
+            uint8_t *dst = (uint8_t *)TANOS_LOAD_ADDR;
+            disk_read(boot_drive_num, TANOS_DISK_SECTOR, TANOS_DISK_SECTS, dst);
+
+            /* Step 2: show magic bytes for debug */
+            uint32_t *magic = (uint32_t *)dst;
+            vga_dbg[1] = 0x5F30 | ((*magic >> 24) & 0xFF);
+
+            if (*magic != 0x544E4F53) {
+                /* Show 'M' in red — magic mismatch */
+                vga_dbg[0] = 0x4F4D;
+                goto fail;
+            }
+
+            /* Step 3: show 'J' — jumping */
+            vga_dbg[0] = 0x5F4A;
+
+            uint64_t entry = *(uint64_t *)(dst + 16);
+            void (*kentry)(void *) = (void (*)(void *))entry;
+            kentry((void *)0);
+            break;
+        }
+
+        case OS_LINUX:
+        case OS_CUSTOM:
+        default:
+            vga_dbg[0] = 0x4F3F;  /* '?' red — unknown OS */
+            goto fail;
+    }
+
+fail:
+    vga_dbg[0] = 0x4F46;  /* 'F' red — fail */
     __asm__ volatile ("cli; hlt");
     __builtin_unreachable();
 }
@@ -460,67 +579,73 @@ static void __attribute__((noreturn)) boot_entry(BootEntry *e) {
  * rsi = TOOTBOOT_MAGIC
  * rdx = PML4 address
  * ---------------------------------------------------------------------------*/
+/* Boot drive passed from boot0 via rdi (TootBoot ABI header has it) */
 void __attribute__((section(".boot1_entry"))) boot1_entry_point(void) {
     /* Clear screen with purple background */
     vga_fill(' ', COLOR_NORMAL);
 
-    /* Discover systems */
+    /* Discover systems — scan MBR partition table */
     detect_systems();
     parse_config();
 
-    /* Fallback: always show TanOS if nothing detected */
+    /* Always ensure TanOS is listed (sector 34 hardcoded for now) */
     if (entry_count == 0)
-        add_entry("TanOS (default)", 0, OS_TANOS);
+        add_entry("TanOS", 0, OS_TANOS);
 
     redraw();
 
     pic_remap();
-    pit_init_1ms();
 
-    /* Main loop — 1ms ticks, count to 1000 for 1 second */
-    uint32_t tick = 0;
+    /* Wait for GTK/QEMU window to stabilize before reading keyboard.
+     * Without this, QEMU sends spurious PS/2 bytes on window focus. */
+    for (volatile uint32_t d = 0; d < 5000000; d++)
+        __asm__ volatile ("pause");
+
+    /* Drain PS/2 buffer after stabilization delay */
+    while (inb(0x64) & 0x01) inb(0x60);
+
+    /* Main loop — RTC seconds based countdown */
+    uint8_t last_sec = rtc_seconds();
 
     while (1) {
-        /* Poll keyboard */
+        /* Poll keyboard — only act on key-press (not release) */
         uint8_t key = kb_poll();
-        if (key & 0x80) goto next_tick;  /* ignore key-release scancodes */
 
-        if (key) {
-            timeout = -1;
-
+        if (key && !(key & 0x80)) {
             switch (key) {
                 case KEY_UP:
                     if (selected > 0) { selected--; redraw(); }
+                    timeout = -1;
+                    draw_timeout();
                     break;
                 case KEY_DOWN:
                     if (selected < entry_count - 1) { selected++; redraw(); }
+                    timeout = -1;
+                    draw_timeout();
                     break;
                 case KEY_ENTER:
                     boot_entry(&entries[selected]);
                     break;
                 default:
+                    /* Ignore all other scancodes — no timeout cancel */
                     break;
             }
         }
 
-next_tick:
-        if (timeout < 0) {
-            pit_wait_ms(1);
-            continue;
-        }
-
-        /* 1ms tick — count to 1000 for 1 second */
-        pit_wait_ms(1);
-        tick++;
-
-        if (tick >= 1000) {
-            tick = 0;
-            if (timeout > 0) {
+        /* Timeout countdown using RTC seconds */
+        if (timeout > 0) {
+            uint8_t cur_sec = rtc_seconds();
+            if (cur_sec != last_sec) {
+                last_sec = cur_sec;
                 timeout--;
                 draw_timeout();
-            } else {
-                boot_entry(&entries[0]);
             }
+        } else if (timeout == 0) {
+            boot_entry(&entries[0]);
         }
+
+        /* Small busy delay to avoid hammering ports */
+        for (volatile int i = 0; i < 1000; i++)
+            __asm__ volatile ("pause");
     }
 }
